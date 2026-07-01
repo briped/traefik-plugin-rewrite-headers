@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"regexp"
@@ -41,19 +42,33 @@ type rewriteBody struct {
 
 // New creates and returns a new rewrite body plugin instance.
 func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	rewrites := make([]rewrite, len(config.Rewrites))
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if next == nil {
+		return nil, fmt.Errorf("next handler cannot be nil")
+	}
+
+	rewrites := make([]rewrite, 0, len(config.Rewrites))
 
 	for i, rewriteConfig := range config.Rewrites {
+		if rewriteConfig.Header == "" {
+			return nil, fmt.Errorf("rewrite %d missing header", i)
+		}
+		if rewriteConfig.Regex == "" {
+			return nil, fmt.Errorf("rewrite %d missing regex", i)
+		}
+
 		regex, err := regexp.Compile(rewriteConfig.Regex)
 		if err != nil {
 			return nil, fmt.Errorf("error compiling regex %q: %w", rewriteConfig.Regex, err)
 		}
 
-		rewrites[i] = rewrite{
+		rewrites = append(rewrites, rewrite{
 			header:      rewriteConfig.Header,
 			regex:       regex,
 			replacement: rewriteConfig.Replacement,
-		}
+		})
 	}
 
 	return &rewriteBody{
@@ -73,8 +88,9 @@ func (r *rewriteBody) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 type responseWriter struct {
-	writer   http.ResponseWriter
-	rewrites []rewrite
+	writer      http.ResponseWriter
+	rewrites    []rewrite
+	wroteHeader bool
 }
 
 func (r *responseWriter) Header() http.Header {
@@ -82,10 +98,20 @@ func (r *responseWriter) Header() http.Header {
 }
 
 func (r *responseWriter) Write(bytes []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+
 	return r.writer.Write(bytes)
 }
 
 func (r *responseWriter) WriteHeader(statusCode int) {
+	if r.wroteHeader {
+		return
+	}
+
+	r.wroteHeader = true
+
 	for _, rewrite := range r.rewrites {
 		headers := r.writer.Header().Values(rewrite.header)
 
@@ -117,4 +143,24 @@ func (r *responseWriter) Flush() {
 	if flusher, ok := r.writer.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+func (r *responseWriter) Push(target string, opts *http.PushOptions) error {
+	if pusher, ok := r.writer.(http.Pusher); ok {
+		return pusher.Push(target, opts)
+	}
+
+	return http.ErrNotSupported
+}
+
+func (r *responseWriter) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+
+	if rf, ok := r.writer.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+
+	return io.Copy(r.writer, src)
 }
